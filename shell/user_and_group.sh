@@ -37,4 +37,4 @@ getent group
 sudo chown royceyan:royceyan /data/people/royceyan/
 # sudo chmod 700 /data/people/royceyan/  -->redundant bcs of next
 sudo setfacl -d -m u::rwx,g::---,o::--- /data/people/royceyan/
-sudo ln -sT /data/people/royceyan /home/royceyan/entry
+sudo ln -sT /data/people/royceyan /home/royceyan/hub
