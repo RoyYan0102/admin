@@ -5,7 +5,7 @@
 # action. `vm --status` with no machine word is the pay-as-you-go one (the form of
 # every earlier call). --start / --stop as before; --status, --wait, --history added
 # 2026-09-26; --vpn, and --start / --wait / --status connecting the VPN first,
-# 2026-09-29; the machine word 2026-10-01.
+# 2026-09-29; the machine word 2026-10-01; --cost (the resource group's spend by day) 2026-10-02.
 RG=OIM-CONTAINERS-UKSOUTH
 VPN="Osmosis Azure VPN"   # an Azure VPN Client profile: ssh to the VMs' private addresses needs it
 
@@ -157,8 +157,56 @@ case "$1" in
             -o tsv | sed -E 's|Microsoft.Compute/virtualMachines/||; s|/action||' | sort
         ;;
 
+    --cost)
+        # spend over the past three local calendar days as `runtime | cost USD | cost GBP`
+        # per day for the pay-as-you-go VM, the spot VM, every managed disk, the rest of the
+        # group and the total. One source per day: the two past days from Cost Management
+        # (posted usage, at the resource group's scope — the subscription's is refused; two
+        # queries, the API takes two aggregations at most); today live, from the VMs'
+        # start / stop events in the activity log (the schedule's and evictions included),
+        # cross-checked with the instance view, times the current retail hourly price of
+        # each VM's size, disks and the rest prorated from the last posted day. Cost
+        # Management allows a few queries a minute on the scope. Read-only; needs az login.
+        # Formatting and the live arithmetic: vm_cost.py beside this script.
+        here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+        sub=$(az account show --query id -o tsv 2>/dev/null) || { echo "az account show failed: az login?"; exit 1; }
+        from=$(date -u -d "$(date -d '2 days ago' +%F) 00:00" +%Y-%m-%dT%H:%M:%SZ)
+        to=$(date -u -d "$(date -d yesterday +%F) 23:59:59" +%Y-%m-%dT%H:%M:%SZ)
+        url="https://management.azure.com/subscriptions/$sub/resourceGroups/$RG/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
+        period="\"type\":\"ActualCost\",\"timeframe\":\"Custom\",\"timePeriod\":{\"from\":\"$from\",\"to\":\"$to\"}"
+        q1="{$period,\"dataset\":{\"granularity\":\"Daily\",\"aggregation\":{\"totalCost\":{\"name\":\"Cost\",\"function\":\"Sum\"},\"usage\":{\"name\":\"UsageQuantity\",\"function\":\"Sum\"}},\"grouping\":[{\"type\":\"Dimension\",\"name\":\"ResourceId\"},{\"type\":\"Dimension\",\"name\":\"MeterCategory\"},{\"type\":\"Dimension\",\"name\":\"UnitOfMeasure\"}]}}"
+        q2="{$period,\"dataset\":{\"granularity\":\"Daily\",\"aggregation\":{\"totalCostUSD\":{\"name\":\"CostUSD\",\"function\":\"Sum\"}},\"grouping\":[{\"type\":\"Dimension\",\"name\":\"ResourceId\"}]}}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        if ! az rest --method post --url "$url" --body "$q1" -o json >"$tmp/q1.json" 2>"$tmp/err"; then
+            case "$(cat "$tmp/err")" in
+                *"Too many requests"*|*'"429"'*) echo "Cost Management is rate-limiting this scope (a few queries a minute): try again in a minute" ;;
+                *RBACAccessDenied*|*Unauthorized*) echo "Cost Management refused the query: az login, or a reader role on $RG" ;;
+                *) echo "Cost Management query failed:"; cat "$tmp/err" ;;
+            esac
+            exit 1
+        fi
+        # the USD query may fail on its own (rate limit): the posted days then show GBP alone
+        az rest --method post --url "$url" --body "$q2" -o json >"$tmp/q2.json" 2>&1 || true
+        # today's running intervals: every start / deallocate / powerOff that succeeded on either
+        # VM in the last two days (a start yesterday may still be running); the log indexes an
+        # event within minutes, the instance view covers the gap
+        az monitor activity-log list --resource-group "$RG" --offset 2d --max-events 2000 \
+            --query "[?status.value=='Succeeded' && contains(resourceId,'/virtualMachines/') && (contains(operationName.value,'/start/action') || contains(operationName.value,'/deallocate/action') || contains(operationName.value,'/powerOff/action'))].[eventTimestamp, resourceId, operationName.value]" \
+            -o tsv >"$tmp/events.tsv" 2>/dev/null || : >"$tmp/events.tsv"
+        {
+            echo "["
+            az vm get-instance-view --resource-group "$RG" --name "$(name_of payg)" -o json
+            echo ","
+            az vm get-instance-view --resource-group "$RG" --name "$(name_of spot)" -o json
+            echo "]"
+        } >"$tmp/vms.json" 2>/dev/null
+        python3 "$here/vm_cost.py" "$tmp/q1.json" "$tmp/q2.json" "$tmp/events.tsv" "$tmp/vms.json" \
+            "$(date -d '2 days ago' +%Y%m%d)" "$(date -d yesterday +%Y%m%d)" "$(date +%Y%m%d)"
+        ;;
+
     *)
-        echo "Usage: vm [payg|spot] --start | --stop | --status | --wait | --vpn | --history   (no machine word: payg; --start moves the data disk to the machine starting and refuses while the other runs)"
+        echo "Usage: vm [payg|spot] --start | --stop | --status | --wait | --vpn | --history | --cost   (no machine word: payg; --start moves the data disk to the machine starting and refuses while the other runs; --cost: the group's spend by day, past 3 days, runtime | USD | GBP; today live from the activity log, before from Cost Management)"
         exit 1
         ;;
 esac
