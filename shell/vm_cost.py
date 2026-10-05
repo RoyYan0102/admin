@@ -72,7 +72,9 @@ def _hm(hours: float) -> str:
 
 def _parse_time(text: str) -> datetime:
     text = text.strip().replace("Z", "+00:00")
-    text = re.sub(r"(\.\d{6})\d+", r"\1", text)  # Azure's 7 fractional digits -> 6
+    # the fraction as exactly six digits: Azure writes 1 to 7 (.15522, .1234567), and the
+    # system python3 (3.10) parses only 3 or 6
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text)
     return datetime.fromisoformat(text)
 
 
