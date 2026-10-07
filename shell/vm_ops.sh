@@ -3,10 +3,15 @@
 # the machine — `payg` (high-spec-linux-vm, 10.45.0.4, pay as you go) or `spot`
 # (high-spec-spot, 10.45.0.5, a spot VM Azure may deallocate for capacity) — then the
 # action. `vm --status` with no machine word is the pay-as-you-go one (the form of
-# every earlier call). --start / --stop as before; --status, --wait, --history added
-# 2026-09-26; --vpn, and --start / --wait / --status connecting the VPN first,
-# 2026-09-29; the machine word 2026-10-01; --cost (the resource group's spend by day) 2026-10-02.
-RG=OIM-CONTAINERS-UKSOUTH
+# every earlier call). --start / --stop are vm_power.sh's (beside this file, sourced here:
+# az alone, the data disk moved to the machine starting; the team runs that file on its
+# own). What needs this laptop stays here: --vpn connects the VPN (ssh to the VMs' private
+# addresses needs it), --wait waits for ssh, --status adds what ssh sees; --history and
+# --cost read Azure's logs and Cost Management. The machine word 2026-10-01, --cost
+# 2026-10-02, the split 2026-10-07.
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/vm_power.sh"
+RG=$VM_RG
+DATA_DISK=$VM_DATA_DISK
 VPN="Osmosis Azure VPN"   # an Azure VPN Client profile: ssh to the VMs' private addresses needs it
 
 MACHINE=payg
@@ -15,57 +20,11 @@ case "$1" in
     --*|"") ;;
     *) echo "no machine '$1': payg or spot"; exit 1 ;;
 esac
+NAME=$(vm_name_of "$MACHINE")
 case "$MACHINE" in
-    payg) NAME=high-spec-linux-vm; HOST=oimvm ;;    # ~/.ssh/config
-    spot) NAME=high-spec-spot;     HOST=oimspot ;;  # ~/.ssh/config; a spot VM, eviction = deallocate
+    payg) HOST=oimvm ;;    # ~/.ssh/config
+    spot) HOST=oimspot ;;  # ~/.ssh/config; a spot VM, eviction = deallocate
 esac
-# The data disk (/data) is one disk the two machines take turns with. ext4 takes one
-# mounting machine at a time: on 10-01 the spot booted and mounted it while the payg had
-# it (attached to both, maxShares 3) and the filesystem took errors. So --start refuses
-# unless the other machine is stopped, then moves the disk to the machine it starts
-# (detach, attach at lun 1, caching None: the only setting Premium SSD v2 takes). While
-# maxShares is still above 1 it detaches the disk from both, sets 1 (Azure changes it only
-# on a detached disk) and attaches it here: from then on Azure refuses a second attachment.
-# Both fstabs mount /data by UUID with nofail, so a machine started without it still boots.
-DATA_DISK=vm-data-drive
-name_of() { case "$1" in payg) echo high-spec-linux-vm ;; spot) echo high-spec-spot ;; esac; }
-other() { [ "$MACHINE" = payg ] && echo spot || echo payg; }
-power_of() {
-    az vm get-instance-view --resource-group "$RG" --name "$1" \
-        --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv
-}
-# the names of the VMs the data disk is attached to, one per line (none: detached)
-disk_holders() {
-    local ids
-    ids=$(az disk show --resource-group "$RG" --name "$DATA_DISK" \
-        --query "[managedBy, managedByExtended[]][] | [?@ != null]" -o tsv) || return 1
-    printf '%s\n' "$ids" | sed 's|.*/||' | sort -u | sed '/^$/d'
-}
-disk_shares() { az disk show --resource-group "$RG" --name "$DATA_DISK" --query maxShares -o tsv; }
-# the data disk onto this machine; --start has checked that both machines are stopped
-move_disk_here() {
-    local holders shares h
-    holders=$(disk_holders) || return 1
-    shares=$(disk_shares) || return 1
-    [ "$holders" = "$NAME" ] && [ "${shares:-1}" -le 1 ] && return 0
-    for h in $holders; do
-        case "$h" in
-            high-spec-linux-vm|high-spec-spot) ;;
-            *) echo "$DATA_DISK is attached to $h, which is neither machine: left alone"; return 1 ;;
-        esac
-    done
-    for h in $holders; do
-        echo "Detaching $DATA_DISK from $h..."
-        az vm disk detach --resource-group "$RG" --vm-name "$h" --name "$DATA_DISK" -o none || return 1
-    done
-    if [ "${shares:-1}" -gt 1 ]; then
-        az disk update --resource-group "$RG" --name "$DATA_DISK" --max-shares 1 -o none || return 1
-        echo "$DATA_DISK: maxShares $shares -> 1, so Azure refuses a second attachment from now on"
-    fi
-    echo "Attaching $DATA_DISK to $NAME (lun 1)..."
-    az vm disk attach --resource-group "$RG" --vm-name "$NAME" --name "$DATA_DISK" \
-        --lun 1 --caching None -o none
-}
 
 # vpn_up: connect the VPN unless it is. From WSL: Windows' rasdial with the Azure VPN
 # Client's phonebook, no prompt while the app's sign-in is cached; elsewhere, nothing.
@@ -79,49 +38,20 @@ vpn_up() {
     vpn_connected || { echo "VPN not connected: connect \"$VPN\" in the Azure VPN Client"; return 1; }
 }
 
-power_state() {
-    az vm get-instance-view --resource-group "$RG" --name "$NAME" \
-        --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv
-}
-
 case "$1" in
     --start)
-        vpn_up
-        here=$(power_state)
-        case "$here" in
-            "VM deallocated"|"VM stopped") ;;
-            "VM running")
-                holders=$(disk_holders | paste -sd ' ' -)
-                echo "$NAME ($MACHINE) is already running; data disk $DATA_DISK: ${holders:-detached}"
-                exit 0 ;;
-            "") echo "could not read $NAME's state (az login?): not started"; exit 1 ;;
-            *) echo "$NAME ($MACHINE): $here — try again once it has settled"; exit 1 ;;
-        esac
-        there=$(power_of "$(name_of "$(other)")")
-        case "$there" in
-            "VM deallocated"|"VM stopped") ;;
-            "") echo "could not read $(name_of "$(other)")'s state (az login?): not started"; exit 1 ;;
-            *) echo "$(other) ($(name_of "$(other)")): $there — one machine at a time holds $DATA_DISK: vm $(other) --stop first"
-               exit 1 ;;
-        esac
-        move_disk_here || { echo "$DATA_DISK could not be moved to $NAME: not started"; exit 1; }
-        echo "Starting $NAME ($MACHINE)..."
-        if ! az vm start --resource-group "$RG" --name "$NAME"; then
-            [ "$MACHINE" = spot ] && echo "a spot VM starts only when Azure has the capacity: try again later, or payg"
-            exit 1
-        fi
+        vm_power_start "$MACHINE"
         ;;
 
     --stop)
-        echo "Stopping $NAME ($MACHINE)..."
-        az vm deallocate --resource-group "$RG" --name "$NAME"
+        vm_power_stop "$MACHINE"
         ;;
 
     --status)
-        state=$(power_state)
+        state=$(vm_power_of "$NAME")
         echo "$MACHINE ($NAME, $HOST): $state"
-        holders=$(disk_holders | paste -sd ' ' -)
-        shares=$(disk_shares)
+        holders=$(vm_disk_holders | paste -sd ' ' -)
+        shares=$(vm_disk_shares)
         echo "data disk $DATA_DISK: ${holders:-detached}$([ "${shares:-1}" -gt 1 ] && echo " (maxShares $shares: the next --start sets 1)")"
         if [ "$state" = "VM running" ]; then
             vpn_up
@@ -196,9 +126,9 @@ case "$1" in
             -o tsv >"$tmp/events.tsv" 2>/dev/null || : >"$tmp/events.tsv"
         {
             echo "["
-            az vm get-instance-view --resource-group "$RG" --name "$(name_of payg)" -o json
+            az vm get-instance-view --resource-group "$RG" --name "$(vm_name_of payg)" -o json
             echo ","
-            az vm get-instance-view --resource-group "$RG" --name "$(name_of spot)" -o json
+            az vm get-instance-view --resource-group "$RG" --name "$(vm_name_of spot)" -o json
             echo "]"
         } >"$tmp/vms.json" 2>/dev/null
         python3 "$here/vm_cost.py" "$tmp/q1.json" "$tmp/q2.json" "$tmp/events.tsv" "$tmp/vms.json" \
@@ -206,7 +136,7 @@ case "$1" in
         ;;
 
     *)
-        echo "Usage: vm [payg|spot] --start | --stop | --status | --wait | --vpn | --history | --cost   (no machine word: payg; --start moves the data disk to the machine starting and refuses while the other runs; --cost: the group's spend by day, past 3 days, runtime | USD | GBP; today live from the activity log, before from Cost Management)"
+        echo "Usage: vm [payg|spot] --start | --stop | --status | --wait | --vpn | --history | --cost   (no machine word: payg; --start moves the data disk to the machine starting and refuses while the other runs — vm_power.sh, az alone; --vpn / --wait / --status reach the machine from here; --cost: the group's spend by day, past 3 days, runtime | USD | GBP; today live from the activity log, before from Cost Management)"
         exit 1
         ;;
 esac
